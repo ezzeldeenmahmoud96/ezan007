@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ezan-cache-v1';
+const CACHE_NAME = 'ezan-cache-v2';
 const APP_SHELL = ['./index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -17,14 +17,21 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
-// Cache-first for the app shell; network for everything else (API calls, fonts)
-// so Gemini/Firebase requests always go live and are never served stale.
+// Network-first for the app shell: always try to fetch the latest version first,
+// so updates show up immediately whenever you're online. Only falls back to the
+// cached copy if there's no internet connection, so the app still opens offline.
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   const isAppShell = APP_SHELL.some(f => url.pathname.endsWith(f.replace('./', '')));
   if (isAppShell) {
     event.respondWith(
-      caches.match(event.request).then((cached) => cached || fetch(event.request))
+      fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+          return response;
+        })
+        .catch(() => caches.match(event.request))
     );
   }
 });
