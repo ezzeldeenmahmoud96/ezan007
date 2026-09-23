@@ -545,6 +545,11 @@ function fileToText(file){
 
 async function extractVocab(text, imageFile, language){
   const lang = language || 'English';
+  const germanRule = lang === 'German' ? `
+GERMAN-SPECIFIC RULES (important, follow exactly):
+- If the term is a noun, the "term" field MUST include the correct definite article as part of the word itself — e.g. "der Tisch", "die Frau", "das Buch". Never give a bare noun without its article.
+- If the term is a verb, also provide a "pastForm" field with its past participle (Partizip II) — e.g. for "machen" give "gemacht", for "gehen" give "gegangen". Leave "pastForm" as an empty string "" for nouns and everything else.` : `
+- Include a "pastForm" field in every item, always as an empty string "" (not used for this language).`;
   const prompt = `You are building language-study flashcards from material a student uploaded. The student is practicing ${lang}.
 From the content, extract up to 12 distinct ${lang} words or terms worth studying (skip trivial/common function words).
 For each term, provide:
@@ -553,8 +558,10 @@ For each term, provide:
 - "sentences": exactly 3 different example sentences in ${lang} using the term naturally (must be different from each other)
 - "distractors": exactly 3 plausible-but-wrong Arabic meanings (near-meanings, not obviously silly)
 - "mnemonic": one short memorization aid (a trick, association, or vivid image), written entirely in ${lang} (the language being practiced, NOT Arabic), to help the word stick in memory. This is NOT a clue to the answer, it's a memory trick.
+- "pastForm": see rule below
+${germanRule}
 Respond with ONLY a raw JSON array, no markdown fences, no commentary. Schema:
-[{"term":"","meaning_ar":"","sentences":["","",""],"distractors":["","",""],"mnemonic":""}]`;
+[{"term":"","meaning_ar":"","sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":""}]`;
 
   let content;
   if(imageFile){
@@ -1017,7 +1024,7 @@ async function renderVocabManage(main){
       const newCards = items.map(it=>({
         id: 'w'+Date.now()+Math.random().toString(36).slice(2,7),
         term: it.term, meaning_ar: it.meaning_ar,
-        sentences: it.sentences, distractors: it.distractors, mnemonic: it.mnemonic,
+        sentences: it.sentences, distractors: it.distractors, mnemonic: it.mnemonic, pastForm: it.pastForm || '',
         stage: 0, wrongStreak: 0, streak: 0, hintUsed:false
       }));
       const merged = deck.concat(newCards);
@@ -1057,7 +1064,7 @@ async function renderVocabManage(main){
       const tr = document.createElement('tr');
       const stageLabel = w.streak>=6 ? 'mastered' : `stage ${w.stage}${w.streak>0?(' · streak '+w.streak):''}`;
       let saveCell = '';
-      const tdTerm = document.createElement('td'); tdTerm.textContent = w.term;
+      const tdTerm = document.createElement('td'); tdTerm.textContent = w.term + (w.pastForm ? ' · ' + w.pastForm : '');
       const tdAr = document.createElement('td'); tdAr.className='ar'; tdAr.textContent = w.meaning_ar;
       const tdStage = document.createElement('td'); tdStage.className='mono'; tdStage.style.fontSize='11px'; tdStage.style.color='var(--ink-dim)'; tdStage.textContent = stageLabel;
       const tdDel = document.createElement('td'); tdDel.className='del'; tdDel.textContent='✕';
@@ -1196,6 +1203,13 @@ function renderCardBody(main, deck, word){
   }
   cw.appendChild(termRow);
 
+  if(word.pastForm){
+    const pastEl = document.createElement('div');
+    pastEl.style.marginTop='2px'; pastEl.style.fontSize='15px'; pastEl.style.color='var(--ink-dim)'; pastEl.style.fontFamily="'IBM Plex Mono',monospace";
+    pastEl.textContent = word.pastForm;
+    cw.appendChild(pastEl);
+  }
+
   const sentenceText = word.sentences[studyState.sentenceIdx % word.sentences.length];
   const sentenceRow = document.createElement('div');
   sentenceRow.style.display='flex'; sentenceRow.style.alignItems='center'; sentenceRow.style.justifyContent='center'; sentenceRow.style.gap='8px'; sentenceRow.style.marginTop='14px'; sentenceRow.style.flexWrap='wrap';
@@ -1318,7 +1332,7 @@ async function handleAnswer(word, correct, btnEl, containerEl, spellingClose){
         const rest = deck.filter(x=>x.id!==w.id);
         await setDeck(route.deckKey, rest, route.ephemeral);
         const mastered = await getMastered(route.deckKey, route.ephemeral);
-        mastered.push({term:w.term, meaning_ar:w.meaning_ar});
+        mastered.push({term:w.term, meaning_ar:w.meaning_ar, pastForm:w.pastForm||''});
         await setMastered(route.deckKey, mastered, route.ephemeral);
         toast(`"${w.term}" mastered! Moved to your mastered list.`);
         setTimeout(async ()=>{ const d2 = await getDeck(route.deckKey, route.ephemeral); if(d2.length){ pickNextCard(d2); render(); } else { go({...route, screen:'vocab_manage'}); } }, 700);
@@ -1414,6 +1428,12 @@ async function renderMasteredPractice(main){
   termRow.appendChild(termEl);
   termRow.appendChild(speakBtn(word.term, LANG_CODES[route.subject] || 'en-US'));
   cw.appendChild(termRow);
+  if(word.pastForm){
+    const pastEl = document.createElement('div');
+    pastEl.style.marginTop='2px'; pastEl.style.fontSize='15px'; pastEl.style.color='var(--ink-dim)'; pastEl.style.fontFamily="'IBM Plex Mono',monospace";
+    pastEl.textContent = word.pastForm;
+    cw.appendChild(pastEl);
+  }
   main.appendChild(cw);
   const grid = document.createElement('div'); grid.className='options-grid';
   const opts = shuffle([word.meaning_ar, ...distractors]);
