@@ -490,17 +490,44 @@ async function callClaude(content, attempt){
     })
   });
   if(!resp.ok){
-    let errText = '';
-    try{ errText = JSON.stringify(await resp.json()); }catch(e){}
+    let errBody = null;
+    try{ errBody = await resp.json(); }catch(e){}
     if(resp.status===400 || resp.status===403) throw new Error('Your Gemini API key was rejected — check it in Settings.');
-    // 429 = rate limited, 503 = model temporarily overloaded — both are worth a couple of retries
-    if((resp.status===429 || resp.status===503) && attempt < 3){
-      await new Promise(r=>setTimeout(r, attempt * 1500));
-      return callClaude(content, attempt + 1);
+
+    if(resp.status===429 || resp.status===503){
+      // Google tells us exactly how long to wait (RetryInfo.retryDelay) and which quota
+      // was hit (QuotaFailure.violations[].quotaId) — read both instead of guessing.
+      const details = (errBody && errBody.error && errBody.error.details) || [];
+      const retryInfo = details.find(d => d['@type'] && d['@type'].includes('RetryInfo'));
+      const quotaInfo = details.find(d => d['@type'] && d['@type'].includes('QuotaFailure'));
+      const quotaId = quotaInfo && quotaInfo.violations && quotaInfo.violations[0] && quotaInfo.violations[0].quotaId || '';
+      const isDailyLimit = /PerDay/i.test(quotaId);
+      let waitSeconds = null;
+      if(retryInfo && retryInfo.retryDelay){
+        const m = String(retryInfo.retryDelay).match(/(\d+(\.\d+)?)/);
+        if(m) waitSeconds = Math.ceil(parseFloat(m[1]));
+      }
+
+      if(isDailyLimit){
+        // Waiting won't help within the same session — this resets at midnight Pacific time, not per-minute.
+        throw new Error('You\'ve used up today\'s free Gemini requests for this key. This resets once a day (around 10am Egypt time) — not something waiting a few minutes fixes. Try again later, or add a different API key in Settings.');
+      }
+
+      if(resp.status===503 && attempt < 3){
+        await new Promise(r=>setTimeout(r, attempt * 2000));
+        return callClaude(content, attempt + 1);
+      }
+      if(resp.status===429){
+        if(waitSeconds && attempt < 3){
+          await new Promise(r=>setTimeout(r, (waitSeconds + 1) * 1000));
+          return callClaude(content, attempt + 1);
+        }
+        const waitMsg = waitSeconds ? `about ${waitSeconds} seconds` : 'about a minute';
+        throw new Error(`Gemini's per-minute limit was hit — wait ${waitMsg} and try again. (Free-tier keys only allow a small number of requests per minute.)`);
+      }
+      throw new Error('Gemini is overloaded right now — wait a bit and try again.');
     }
-    if(resp.status===429) throw new Error('Gemini is rate-limiting you right now — wait a moment and try again.');
-    if(resp.status===503) throw new Error('Gemini is overloaded right now — this happens sometimes at busy times. Wait a bit and try again.');
-    throw new Error('API error ' + resp.status + ' ' + errText);
+    throw new Error('API error ' + resp.status + ' ' + JSON.stringify(errBody||{}));
   }
   const data = await resp.json();
   const candidate = data.candidates && data.candidates[0];
@@ -554,14 +581,15 @@ GERMAN-SPECIFIC RULES (important, follow exactly):
 From the content, extract up to 12 distinct ${lang} words or terms worth studying (skip trivial/common function words).
 For each term, provide:
 - "term": the word/phrase exactly as it should be studied
-- "meaning_ar": the correct Arabic meaning (natural, accurate)
+- "meaning_ar": the single best, most common Arabic meaning (natural, accurate) — this is what's used for multiple-choice
+- "meaning_alts": an array of OTHER genuinely correct Arabic meanings for this word, if the word has more than one valid sense (e.g. a word meaning both "light" and "lamp"). If it only really has one meaning, return an empty array [].
 - "sentences": exactly 3 different example sentences in ${lang} using the term naturally (must be different from each other)
 - "distractors": exactly 3 plausible-but-wrong Arabic meanings (near-meanings, not obviously silly)
 - "mnemonic": one short memorization aid (a trick, association, or vivid image), written entirely in ${lang} (the language being practiced, NOT Arabic), to help the word stick in memory. This is NOT a clue to the answer, it's a memory trick.
 - "pastForm": see rule below
 ${germanRule}
 Respond with ONLY a raw JSON array, no markdown fences, no commentary. Schema:
-[{"term":"","meaning_ar":"","sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":""}]`;
+[{"term":"","meaning_ar":"","meaning_alts":[],"sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":""}]`;
 
   let content;
   if(imageFile){
@@ -1025,6 +1053,7 @@ async function renderVocabManage(main){
         id: 'w'+Date.now()+Math.random().toString(36).slice(2,7),
         term: it.term, meaning_ar: it.meaning_ar,
         sentences: it.sentences, distractors: it.distractors, mnemonic: it.mnemonic, pastForm: it.pastForm || '',
+        meaning_alts: Array.isArray(it.meaning_alts) ? it.meaning_alts : [],
         stage: 0, wrongStreak: 0, streak: 0, hintUsed:false
       }));
       const merged = deck.concat(newCards);
@@ -1242,7 +1271,8 @@ function renderCardBody(main, deck, word){
 
   if(studyState.revealed){
     const rb = document.createElement('div'); rb.className='reveal-box';
-    rb.innerHTML = `<div style="font-size:12px;color:var(--ink-dim);margin-bottom:6px;">answer</div><div class="ans">${word.meaning_ar}</div>`;
+    const altsText = (word.meaning_alts && word.meaning_alts.length) ? ` <span style="color:var(--ink-dim);font-size:14px;">(also: ${word.meaning_alts.join('، ')})</span>` : '';
+    rb.innerHTML = `<div style="font-size:12px;color:var(--ink-dim);margin-bottom:6px;">answer</div><div class="ans">${word.meaning_ar}${altsText}</div>`;
     main.appendChild(rb);
     const btnRow = document.createElement('div'); btnRow.className='btn-row'; btnRow.style.justifyContent='center'; btnRow.style.marginTop='16px';
     const nextBtn = document.createElement('button'); nextBtn.className='btn'; nextBtn.textContent='Next word';
@@ -1268,8 +1298,11 @@ function renderCardBody(main, deck, word){
     const submit = document.createElement('button'); submit.className='btn'; submit.textContent='Check';
     submit.onclick = ()=>{
       const val = inp.value.trim();
-      const correct = normalizeArabic(val) === normalizeArabic(word.meaning_ar);
-      const spellingClose = !correct && val.length>0 && levenshtein(normalizeArabic(val), normalizeArabic(word.meaning_ar)) <= 2;
+      const normVal = normalizeArabic(val);
+      const acceptableMeanings = [word.meaning_ar, ...(word.meaning_alts||[])];
+      const correct = acceptableMeanings.some(m => normalizeArabic(m) === normVal);
+      const closestDistance = Math.min(...acceptableMeanings.map(m => levenshtein(normVal, normalizeArabic(m))));
+      const spellingClose = !correct && val.length>0 && closestDistance <= 2;
       handleAnswer(word, correct, submit, row, spellingClose);
     };
     row.appendChild(submit);
@@ -1969,8 +2002,25 @@ async function handleDrillAnswer(item, correct, btnEl, containerEl, drillKey){
 /* ============================= HISTORY ============================= */
 /* ============================= FIREBASE AUTH ============================= */
 
+// This config isn't a secret (Google's own docs confirm it's safe to be public in
+// client code — security comes from the Firestore rules + login, not from hiding this).
+// Baked in as a default so this app never loses its connection, even if a device's
+// local storage gets wiped. A locally-saved config (if ever set) still overrides this.
+const DEFAULT_FIREBASE_CONFIG = {
+  apiKey: "AIzaSyBn5NpO9NpIh_CZoHdnd-zBRUrai_pp0jo",
+  authDomain: "ezan007-787c9.firebaseapp.com",
+  projectId: "ezan007-787c9",
+  storageBucket: "ezan007-787c9.firebasestorage.app",
+  messagingSenderId: "360024655858",
+  appId: "1:360024655858:web:729ee5136096fd825dcd6b"
+};
+
 function getFirebaseConfig(){
-  try{ return JSON.parse(localStorage.getItem('ezan:firebase_config') || 'null'); }catch(e){ return null; }
+  try{
+    const local = JSON.parse(localStorage.getItem('ezan:firebase_config') || 'null');
+    if(local) return local;
+  }catch(e){}
+  return DEFAULT_FIREBASE_CONFIG;
 }
 function saveFirebaseConfig(cfg){
   try{ localStorage.setItem('ezan:firebase_config', JSON.stringify(cfg)); }catch(e){}
