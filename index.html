@@ -486,7 +486,7 @@ async function callClaude(content, attempt){
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({
       contents: [{role:'user', parts: toGeminiParts(content)}],
-      generationConfig: { maxOutputTokens: 8000 }
+      generationConfig: { maxOutputTokens: 16000 }
     })
   });
   if(!resp.ok){
@@ -578,7 +578,7 @@ GERMAN-SPECIFIC RULES (important, follow exactly):
 - If the term is a verb, also provide a "pastForm" field with its past participle (Partizip II) — e.g. for "machen" give "gemacht", for "gehen" give "gegangen". Leave "pastForm" as an empty string "" for nouns and everything else.` : `
 - Include a "pastForm" field in every item, always as an empty string "" (not used for this language).`;
   const prompt = `You are building language-study flashcards from material a student uploaded. The student is practicing ${lang}.
-From the content, extract up to 12 distinct ${lang} words or terms worth studying (skip trivial/common function words).
+Go through the ENTIRE content and extract EVERY distinct ${lang} word or term worth studying — do not skip any, do not cap the count, cover it all completely (skip only trivial/common function words like "the", "a", "und", "le" that aren't worth studying on their own).
 For each term, provide:
 - "term": the word/phrase exactly as it should be studied
 - "meaning_ar": the single best, most common Arabic meaning (natural, accurate) — this is what's used for multiple-choice
