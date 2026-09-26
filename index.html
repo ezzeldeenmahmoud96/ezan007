@@ -575,7 +575,7 @@ async function extractVocab(text, imageFile, language){
   const germanRule = lang === 'German' ? `
 GERMAN-SPECIFIC RULES (important, follow exactly):
 - If the term is a noun, the "term" field MUST include the correct definite article as part of the word itself — e.g. "der Tisch", "die Frau", "das Buch". Never give a bare noun without its article.
-- If the term is a verb, also provide a "pastForm" field with its past participle (Partizip II) — e.g. for "machen" give "gemacht", for "gehen" give "gegangen". Leave "pastForm" as an empty string "" for nouns and everything else.` : `
+- If the term is a verb, ALWAYS normalize the "term" field to its base infinitive form, even if the source material shows it conjugated or in a different tense/form (e.g. if the material shows "gemacht", "macht", or "machte", the "term" should still be "machen" — never save the conjugated form itself as the term). Also provide a "pastForm" field with its past participle (Partizip II) — e.g. for "machen" give "gemacht", for "gehen" give "gegangen". Leave "pastForm" as an empty string "" for nouns and everything else.` : `
 - Include a "pastForm" field in every item, always as an empty string "" (not used for this language).`;
   const prompt = `You are building language-study flashcards from material a student uploaded. The student is practicing ${lang}.
 Go through the ENTIRE content and extract EVERY distinct ${lang} word or term worth studying — do not skip any, do not cap the count, cover it all completely (skip only trivial/common function words like "the", "a", "und", "le" that aren't worth studying on their own).
@@ -1056,9 +1056,27 @@ async function renderVocabManage(main){
         meaning_alts: Array.isArray(it.meaning_alts) ? it.meaning_alts : [],
         stage: 0, wrongStreak: 0, streak: 0, hintUsed:false
       }));
-      const merged = deck.concat(newCards);
+      const existingTerms = new Set(deck.map(w => w.term.trim().toLowerCase()));
+      const uniqueCards = [];
+      const duplicates = [];
+      newCards.forEach(c=>{
+        const key = c.term.trim().toLowerCase();
+        if(existingTerms.has(key)){
+          duplicates.push(c.term);
+        } else {
+          existingTerms.add(key);
+          uniqueCards.push(c);
+        }
+      });
+      const merged = deck.concat(uniqueCards);
       await setDeck(route.deckKey, merged, route.ephemeral);
-      toast(`Added ${newCards.length} words.`);
+      if(duplicates.length && uniqueCards.length){
+        toast(`Added ${uniqueCards.length} word(s). Skipped duplicates: ${duplicates.join(', ')}`);
+      } else if(duplicates.length){
+        toast(`This word is duplicated: ${duplicates.join(', ')}`);
+      } else {
+        toast(`Added ${uniqueCards.length} word(s).`);
+      }
       render();
     }catch(e){
       console.error(e);
