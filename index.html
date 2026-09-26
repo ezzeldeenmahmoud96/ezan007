@@ -1282,8 +1282,40 @@ function renderCardBody(main, deck, word){
     return;
   }
 
+function pickDistractors(deck, word){
+  const correctSet = new Set([word.meaning_ar, ...(word.meaning_alts||[])].map(normalizeArabic));
+  const pool = [];
+  const seen = new Set();
+  deck.forEach(w=>{
+    if(w.id===word.id) return;
+    [w.meaning_ar, ...(w.meaning_alts||[])].forEach(c=>{
+      const norm = normalizeArabic(c);
+      if(c && !correctSet.has(norm) && !seen.has(norm)){
+        seen.add(norm);
+        pool.push(c);
+      }
+    });
+  });
+  let picks = shuffle(pool).slice(0,3);
+  if(picks.length < 3){
+    const pickedNorms = new Set(picks.map(normalizeArabic));
+    const fallback = (word.distractors||[]).filter(d=>{
+      const norm = normalizeArabic(d);
+      return d && !correctSet.has(norm) && !pickedNorms.has(norm);
+    });
+    picks = picks.concat(fallback.slice(0, 3 - picks.length));
+  }
+  // last resort (tiny deck, thin fallback list) — repeat existing distractors rather than show fewer than 3
+  let i = 0;
+  while(picks.length < 3 && word.distractors && word.distractors.length){
+    picks.push(word.distractors[i % word.distractors.length]);
+    i++;
+  }
+  return picks;
+}
+
   if(useOptions){
-    const opts = shuffle([word.meaning_ar, ...word.distractors]);
+    const opts = shuffle([word.meaning_ar, ...pickDistractors(deck, word)]);
     const grid = document.createElement('div'); grid.className='options-grid';
     opts.forEach(opt=>{
       const b = document.createElement('button'); b.className='option-btn'; b.textContent = opt;
@@ -1298,12 +1330,9 @@ function renderCardBody(main, deck, word){
     const submit = document.createElement('button'); submit.className='btn'; submit.textContent='Check';
     submit.onclick = ()=>{
       const val = inp.value.trim();
-      const normVal = normalizeArabic(val);
       const acceptableMeanings = [word.meaning_ar, ...(word.meaning_alts||[])];
-      const correct = acceptableMeanings.some(m => normalizeArabic(m) === normVal);
-      const closestDistance = Math.min(...acceptableMeanings.map(m => levenshtein(normVal, normalizeArabic(m))));
-      const spellingClose = !correct && val.length>0 && closestDistance <= 2;
-      handleAnswer(word, correct, submit, row, spellingClose);
+      const correct = val.length>0 && acceptableMeanings.some(m => fuzzyArabicMatch(val, m));
+      handleAnswer(word, correct, submit, row, false);
     };
     row.appendChild(submit);
     main.appendChild(row);
@@ -1327,6 +1356,20 @@ function normalizeArabic(s){
     .replace(/\s+/g, ' ')
     .trim()
     .toLowerCase();
+}
+
+// A single wrong letter, or a small phrasing difference (e.g. "نتيجة الى ذلك" vs
+// "نتيجة لذلك"), shouldn't count as a wrong answer — only a genuinely different
+// answer should. Tolerance scales with length: short words allow ~2 chars off,
+// longer phrases allow proportionally more.
+function fuzzyArabicMatch(input, target){
+  const a = normalizeArabic(input);
+  const b = normalizeArabic(target);
+  if(!a || !b) return a === b;
+  if(a === b) return true;
+  const dist = levenshtein(a, b);
+  const tolerance = Math.max(2, Math.round(Math.max(a.length, b.length) * 0.25));
+  return dist <= tolerance;
 }
 
 function levenshtein(a,b){
@@ -1928,7 +1971,7 @@ async function renderDrillStudy(main){
     row.appendChild(inp);
     const submit = document.createElement('button'); submit.className='btn'; submit.textContent='Check';
     submit.onclick = ()=>{
-      const correct = normalizeArabic(inp.value) === normalizeArabic(item.answer);
+      const correct = fuzzyArabicMatch(inp.value, item.answer);
       handleDrillAnswer(item, correct, submit, row, drillKey);
     };
     row.appendChild(submit);
