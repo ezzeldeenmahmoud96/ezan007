@@ -233,7 +233,8 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-app.js";
   import {
     getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
-    onAuthStateChanged, signOut, sendPasswordResetEmail
+    onAuthStateChanged, signOut, sendPasswordResetEmail,
+    setPersistence, browserLocalPersistence
   } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-auth.js";
   import {
     getFirestore, doc, getDoc, setDoc
@@ -242,6 +243,7 @@
   window.__firebase = {
     initializeApp, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
     onAuthStateChanged, signOut, sendPasswordResetEmail,
+    setPersistence, browserLocalPersistence,
     getFirestore, doc, getDoc, setDoc
   };
   window.dispatchEvent(new Event('firebase-sdk-ready'));
@@ -817,14 +819,21 @@ function renderSettings(main){
   main.appendChild(syncPanel);
 
   const panel = document.createElement('div'); panel.className='panel';
-  panel.innerHTML = `<h3>Google Gemini API key</h3><div class="save-note" style="margin-bottom:10px;">This app is a standalone page — it needs your own free Gemini key to generate flashcards and questions. Your key stays only in this browser; it's sent directly to Google, nowhere else. This does not sync between devices — enter it on each one.</div>`;
+  const syncNote = currentUser
+    ? 'This app is a standalone page — it needs your own free Gemini key to generate flashcards and questions. Since you\'re logged in, this key is now backed up to your account too — if this device ever loses its local data, logging back in will restore it automatically.'
+    : 'This app is a standalone page — it needs your own free Gemini key to generate flashcards and questions. Your key stays only in this browser right now — log in above to also back it up to your account.';
+  panel.innerHTML = `<h3>Google Gemini API key</h3><div class="save-note" style="margin-bottom:10px;">${syncNote}</div>`;
   const inp = document.createElement('input'); inp.type='password'; inp.placeholder='AIza...';
   inp.value = getApiKey();
   panel.appendChild(inp);
   const btnRow = document.createElement('div'); btnRow.className='btn-row';
   const saveBtn = document.createElement('button'); saveBtn.className='btn'; saveBtn.textContent='Save key';
-  saveBtn.onclick = ()=>{
-    localStorage.setItem('ezan:api_key', inp.value.trim());
+  saveBtn.onclick = async ()=>{
+    const key = inp.value.trim();
+    localStorage.setItem('ezan:api_key', key);
+    if(currentUser && fbDb){
+      try{ await fsSet('api_key', key); }catch(e){ console.error(e); }
+    }
     toast('API key saved.');
   };
   btnRow.appendChild(saveBtn);
@@ -2114,10 +2123,17 @@ async function tryInitFirebase(){
   try{
     fbApp = window.__firebase.initializeApp(cfg);
     fbAuth = window.__firebase.getAuth(fbApp);
+    try{ await window.__firebase.setPersistence(fbAuth, window.__firebase.browserLocalPersistence); }catch(e){ console.error('persistence setup failed', e); }
     fbDb = window.__firebase.getFirestore(fbApp);
     await new Promise(resolve=>{
-      window.__firebase.onAuthStateChanged(fbAuth, (user)=>{
+      window.__firebase.onAuthStateChanged(fbAuth, async (user)=>{
         currentUser = user;
+        if(user && !getApiKey()){
+          try{
+            const savedKey = await fsGet('api_key');
+            if(savedKey) localStorage.setItem('ezan:api_key', savedKey);
+          }catch(e){ console.error(e); }
+        }
         const cameFromLoggedOutFlow = !route || route.screen==='auth' || route.screen==='home';
         if(cameFromLoggedOutFlow){
           route = user ? {screen:'home'} : {screen:'auth'};
