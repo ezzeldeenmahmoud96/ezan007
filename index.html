@@ -589,8 +589,8 @@ For each term, provide:
 - "mnemonic": one short memorization aid (a trick, association, or vivid image), written entirely in ${lang} (the language being practiced, NOT Arabic), to help the word stick in memory. This is NOT a clue to the answer, it's a memory trick.
 - "pastForm": see rule below
 ${germanRule}
-Respond with ONLY a raw JSON array, no markdown fences, no commentary. Schema:
-[{"term":"","meaning_ar":"","meaning_alts":[],"sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":""}]`;
+Respond with ONLY a raw JSON object, no markdown fences, no commentary. Schema:
+{"items":[{"term":"","meaning_ar":"","meaning_alts":[],"sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":""}],"invalid":["any word from the material that was genuinely unrecognizable gibberish, listed exactly as it appeared"]}`;
 
   let content;
   if(imageFile){
@@ -681,7 +681,7 @@ function toast(msg){
   t.className = 'toast';
   t.textContent = msg;
   document.body.appendChild(t);
-  setTimeout(()=>t.remove(), 5000);
+  setTimeout(()=>t.remove(), 10000);
 }
 
 /* ============================= RENDER: SHELL ============================= */
@@ -1049,7 +1049,9 @@ async function renderVocabManage(main){
         text = await fileToText(file);
       }
       if(!text && !imageFile){ toast('Add some text or a file first.'); genBtn.disabled=false; loadingRow.style.display='none'; return; }
-      const items = await extractVocab(text, imageFile, LANG_NAMES[route.subject]);
+      const result = await extractVocab(text, imageFile, LANG_NAMES[route.subject]);
+      const items = result.items || [];
+      const invalidWords = result.invalid || [];
       const newCards = items.map(it=>({
         id: 'w'+Date.now()+Math.random().toString(36).slice(2,7),
         term: it.term, meaning_ar: it.meaning_ar,
@@ -1071,13 +1073,11 @@ async function renderVocabManage(main){
       });
       const merged = deck.concat(uniqueCards);
       await setDeck(route.deckKey, merged, route.ephemeral);
-      if(duplicates.length && uniqueCards.length){
-        toast(`Added ${uniqueCards.length} word(s). Skipped duplicates: ${duplicates.join(', ')}`);
-      } else if(duplicates.length){
-        toast(`This word is duplicated: ${duplicates.join(', ')}`);
-      } else {
-        toast(`Added ${uniqueCards.length} word(s).`);
-      }
+      const messages = [];
+      if(uniqueCards.length) messages.push(`Added ${uniqueCards.length} word(s).`);
+      if(duplicates.length) messages.push(`This word is duplicated: ${duplicates.join(', ')}`);
+      if(invalidWords.length) messages.push(`This word is wrong: ${invalidWords.join(', ')}`);
+      toast(messages.join(' ') || 'Nothing new to add.');
       render();
     }catch(e){
       console.error(e);
