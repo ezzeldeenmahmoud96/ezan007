@@ -233,16 +233,18 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-app.js";
   import {
     getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
-    onAuthStateChanged, signOut, sendPasswordResetEmail
+    onAuthStateChanged, signOut, sendPasswordResetEmail,
+    setPersistence, browserLocalPersistence
   } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-auth.js";
   import {
-    getFirestore, doc, getDoc, setDoc
+    getFirestore, doc, getDoc, setDoc, disableNetwork, enableNetwork
   } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-firestore.js";
 
   window.__firebase = {
     initializeApp, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
     onAuthStateChanged, signOut, sendPasswordResetEmail,
-    getFirestore, doc, getDoc, setDoc
+    setPersistence, browserLocalPersistence,
+    getFirestore, doc, getDoc, setDoc, disableNetwork, enableNetwork
   };
   window.dispatchEvent(new Event('firebase-sdk-ready'));
 </script>
@@ -361,14 +363,101 @@ let memoryStore = {}; // session-only storage for "No History" decks — resets 
 
 // When logged in, everything durable goes to Firestore under this user's own document
 // (so it follows them to any device); otherwise it falls back to this browser's localStorage.
+//
+// Phones freeze network connections when the screen turns off or you switch apps. So:
+//  - every cloud call has a timeout (the app never hangs waiting on a dead connection)
+//  - every save is ALSO kept in a local copy, and re-sent to the cloud later if it didn't go through
+//  - if we couldn't read your saved data, we refuse to save over it (so a bad read can never wipe it)
+const CLOUD_TIMEOUT_MS = 8000;
+const unsafeKeys = new Set();        // keys whose cloud read failed — never overwrite these blindly
+const flushing = new Set();
+
+function withTimeout(promise, ms){
+  return new Promise((resolve, reject)=>{
+    const t = setTimeout(()=>reject(new Error('timeout')), ms);
+    promise.then(v=>{ clearTimeout(t); resolve(v); }, e=>{ clearTimeout(t); reject(e); });
+  });
+}
+function mirrorKey(key){ return 'ezan:mirror:' + currentUser.uid + ':' + key; }
+function getDirty(){ try{ return JSON.parse(localStorage.getItem('ezan:dirty') || '[]'); }catch(e){ return []; } }
+function setDirty(list){ try{ localStorage.setItem('ezan:dirty', JSON.stringify(list)); }catch(e){} }
+function markDirty(mk){ const d = getDirty(); if(!d.includes(mk)){ d.push(mk); setDirty(d); } }
+function clearDirty(mk){ setDirty(getDirty().filter(k=>k!==mk)); }
+function cloudRef(key){
+  return window.__firebase.doc(fbDb, 'users', currentUser.uid, 'data', key.replace(/\//g,'_'));
+}
+
+// Push a locally-kept copy to the cloud (used when an earlier save didn't get through).
+async function flushDirty(key){
+  const mk = mirrorKey(key);
+  if(flushing.has(mk)) return;
+  const local = localStorage.getItem(mk);
+  if(local === null) return;
+  flushing.add(mk);
+  try{
+    await withTimeout(window.__firebase.setDoc(cloudRef(key), { value: local }), CLOUD_TIMEOUT_MS);
+    clearDirty(mk);
+  }catch(e){ /* still offline — stays queued, we'll try again later */ }
+  flushing.delete(mk);
+}
+function flushAllDirty(){
+  if(!(currentUser && fbDb)) return;
+  const prefix = 'ezan:mirror:' + currentUser.uid + ':';
+  getDirty().forEach(mk=>{
+    if(mk.startsWith(prefix)) flushDirty(mk.slice(prefix.length));
+  });
+}
+
 async function fsGet(key){
-  const ref = window.__firebase.doc(fbDb, 'users', currentUser.uid, 'data', key.replace(/\//g,'_'));
-  const snap = await window.__firebase.getDoc(ref);
-  return snap.exists() ? snap.data().value : null;
+  const mk = mirrorKey(key);
+  // Unsent local changes are newer than whatever the cloud has — use them.
+  if(getDirty().includes(mk)){
+    const local = localStorage.getItem(mk);
+    if(local !== null){ flushDirty(key); return local; }
+  }
+  try{
+    const snap = await withTimeout(window.__firebase.getDoc(cloudRef(key)), CLOUD_TIMEOUT_MS);
+    const val = snap.exists() ? snap.data().value : null;
+    try{ if(val !== null) localStorage.setItem(mk, val); }catch(e){}
+    return val;
+  }catch(e){
+    const local = localStorage.getItem(mk);   // cloud unreachable — fall back to the local copy
+    if(local !== null) return local;
+    throw e;
+  }
 }
 async function fsSet(key, value){
-  const ref = window.__firebase.doc(fbDb, 'users', currentUser.uid, 'data', key.replace(/\//g,'_'));
-  await window.__firebase.setDoc(ref, { value });
+  const mk = mirrorKey(key);
+  try{ localStorage.setItem(mk, value); }catch(e){}
+  markDirty(mk);
+  try{
+    await withTimeout(window.__firebase.setDoc(cloudRef(key), { value }), CLOUD_TIMEOUT_MS);
+    clearDirty(mk);
+  }catch(e){
+    console.error('Cloud save is pending (will retry):', e);   // local copy is safe, retried later
+  }
+}
+
+async function cloudRead(fullKey){
+  try{
+    const v = await fsGet(fullKey);
+    unsafeKeys.delete(fullKey);
+    return v ? JSON.parse(v) : [];
+  }catch(e){
+    console.error(e);
+    unsafeKeys.add(fullKey);
+    return [];
+  }
+}
+async function cloudWrite(fullKey, arr){
+  if(unsafeKeys.has(fullKey)){
+    // Our last read failed. Check whether we're really back online before saving anything.
+    try{ await fsGet(fullKey); unsafeKeys.delete(fullKey); }catch(e){}
+    if(unsafeKeys.has(fullKey)){
+      throw new Error("Couldn't reach your saved data (connection problem), so this change was NOT saved — that protects your existing words from being overwritten. Check your internet and try again.");
+    }
+  }
+  await fsSet(fullKey, JSON.stringify(arr));
 }
 
 async function getDeck(key, ephemeral){
@@ -376,10 +465,7 @@ async function getDeck(key, ephemeral){
     const v = memoryStore['deck:'+key];
     return v ? JSON.parse(JSON.stringify(v)) : [];
   }
-  if(currentUser && fbDb){
-    try{ const v = await fsGet('deck:'+key); return v ? JSON.parse(v) : []; }
-    catch(e){ console.error(e); return []; }
-  }
+  if(currentUser && fbDb) return await cloudRead('deck:'+key);
   try{
     const v = localStorage.getItem('ezan:deck:'+key);
     return v ? JSON.parse(v) : [];
@@ -387,10 +473,7 @@ async function getDeck(key, ephemeral){
 }
 async function setDeck(key, arr, ephemeral){
   if(ephemeral){ memoryStore['deck:'+key] = arr; return; }
-  if(currentUser && fbDb){
-    try{ await fsSet('deck:'+key, JSON.stringify(arr)); }catch(e){ console.error(e); }
-    return;
-  }
+  if(currentUser && fbDb){ await cloudWrite('deck:'+key, arr); return; }
   try{ localStorage.setItem('ezan:deck:'+key, JSON.stringify(arr)); }catch(e){ console.error(e); }
 }
 async function getMastered(key, ephemeral){
@@ -398,10 +481,7 @@ async function getMastered(key, ephemeral){
     const v = memoryStore['mastered:'+key];
     return v ? JSON.parse(JSON.stringify(v)) : [];
   }
-  if(currentUser && fbDb){
-    try{ const v = await fsGet('mastered:'+key); return v ? JSON.parse(v) : []; }
-    catch(e){ console.error(e); return []; }
-  }
+  if(currentUser && fbDb) return await cloudRead('mastered:'+key);
   try{
     const v = localStorage.getItem('ezan:mastered:'+key);
     return v ? JSON.parse(v) : [];
@@ -409,12 +489,28 @@ async function getMastered(key, ephemeral){
 }
 async function setMastered(key, arr, ephemeral){
   if(ephemeral){ memoryStore['mastered:'+key] = arr; return; }
-  if(currentUser && fbDb){
-    try{ await fsSet('mastered:'+key, JSON.stringify(arr)); }catch(e){ console.error(e); }
-    return;
-  }
+  if(currentUser && fbDb){ await cloudWrite('mastered:'+key, arr); return; }
   try{ localStorage.setItem('ezan:mastered:'+key, JSON.stringify(arr)); }catch(e){ console.error(e); }
 }
+
+// If a save is refused because we're offline, tell the user instead of failing silently.
+window.addEventListener('unhandledrejection', (e)=>{
+  const msg = e.reason && e.reason.message;
+  if(msg && msg.includes("Couldn't reach your saved data")) toast(msg);
+});
+
+// When you come back to the app (screen on / switched back), wake the connection up
+// and send anything that was waiting.
+document.addEventListener('visibilitychange', async ()=>{
+  if(document.visibilityState !== 'visible') return;
+  try{
+    if(fbDb && window.__firebase.disableNetwork && window.__firebase.enableNetwork){
+      await window.__firebase.disableNetwork(fbDb);
+      await window.__firebase.enableNetwork(fbDb);
+    }
+  }catch(e){}
+  flushAllDirty();
+});
 
 
 /* ============================= AI CALL ============================= */
@@ -575,10 +671,11 @@ async function extractVocab(text, imageFile, language){
   const germanRule = lang === 'German' ? `
 GERMAN-SPECIFIC RULES (important, follow exactly):
 - If the term is a noun, the "term" field MUST include the correct definite article as part of the word itself — e.g. "der Tisch", "die Frau", "das Buch". Never give a bare noun without its article.
-- If the term is a verb, also provide a "pastForm" field with its past participle (Partizip II) — e.g. for "machen" give "gemacht", for "gehen" give "gegangen". Leave "pastForm" as an empty string "" for nouns and everything else.` : `
+- If the term is a verb, ALWAYS normalize the "term" field to its base infinitive form, even if the source material shows it conjugated or in a different tense/form (e.g. if the material shows "gemacht", "macht", or "machte", the "term" should still be "machen" — never save the conjugated form itself as the term). Also provide a "pastForm" field with its past participle (Partizip II) — e.g. for "machen" give "gemacht", for "gehen" give "gegangen". Leave "pastForm" as an empty string "" for nouns and everything else.` : `
 - Include a "pastForm" field in every item, always as an empty string "" (not used for this language).`;
   const prompt = `You are building language-study flashcards from material a student uploaded. The student is practicing ${lang}.
 Go through the ENTIRE content and extract EVERY distinct ${lang} word or term worth studying — do not skip any, do not cap the count, cover it all completely (skip only trivial/common function words like "the", "a", "und", "le" that aren't worth studying on their own).
+IMPORTANT: the student may have typos or misspellings in their uploaded material. If a word is an obvious typo/misspelling of a real ${lang} word, silently correct it to the real, properly-spelled word for the "term" field — never build a flashcard around a misspelled or non-existent word. Only skip a word entirely if it's genuinely unrecognizable gibberish.
 For each term, provide:
 - "term": the word/phrase exactly as it should be studied
 - "meaning_ar": the single best, most common Arabic meaning (natural, accurate) — this is what's used for multiple-choice
@@ -588,8 +685,8 @@ For each term, provide:
 - "mnemonic": one short memorization aid (a trick, association, or vivid image), written entirely in ${lang} (the language being practiced, NOT Arabic), to help the word stick in memory. This is NOT a clue to the answer, it's a memory trick.
 - "pastForm": see rule below
 ${germanRule}
-Respond with ONLY a raw JSON array, no markdown fences, no commentary. Schema:
-[{"term":"","meaning_ar":"","meaning_alts":[],"sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":""}]`;
+Respond with ONLY a raw JSON object, no markdown fences, no commentary. Schema:
+{"items":[{"term":"","meaning_ar":"","meaning_alts":[],"sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":""}],"invalid":["any word from the material that was genuinely unrecognizable gibberish, listed exactly as it appeared"]}`;
 
   let content;
   if(imageFile){
@@ -655,20 +752,28 @@ function playFail(){
 // Fix: "unlock" both audio elements on the very first tap anywhere in the app —
 // once a media element has successfully played once within a real user gesture,
 // browsers allow it to be played programmatically afterward, even from async code.
-document.addEventListener('click', function unlockAudioOnce(){
-  ['success-sound','fail-sound'].forEach(id=>{
-    const el = document.getElementById(id);
-    if(!el) return;
-    const prevMuted = el.muted;
-    el.muted = true;
-    el.play().then(()=>{
-      el.pause();
-      el.currentTime = 0;
-      el.muted = prevMuted;
-    }).catch(()=>{ el.muted = prevMuted; });
-  });
-  document.removeEventListener('click', unlockAudioOnce);
-}, {once:true});
+let audioUnlockArmed = false;
+function armAudioUnlock(){
+  if(audioUnlockArmed) return;
+  audioUnlockArmed = true;
+  document.addEventListener('click', function unlockAudioOnce(){
+    audioUnlockArmed = false;
+    ['success-sound','fail-sound'].forEach(id=>{
+      const el = document.getElementById(id);
+      if(!el) return;
+      const prevMuted = el.muted;
+      el.muted = true;
+      el.play().then(()=>{
+        el.pause();
+        el.currentTime = 0;
+        el.muted = prevMuted;
+      }).catch(()=>{ el.muted = prevMuted; });
+    });
+  }, {once:true});
+}
+armAudioUnlock();
+// After the phone sleeps or you switch apps, browsers can forget the sound permission — ask again on next tap.
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') armAudioUnlock(); });
 
 function flashWrong(){
   const ov = document.getElementById('flash-overlay');
@@ -680,7 +785,7 @@ function toast(msg){
   t.className = 'toast';
   t.textContent = msg;
   document.body.appendChild(t);
-  setTimeout(()=>t.remove(), 2200);
+  setTimeout(()=>t.remove(), 10000);
 }
 
 /* ============================= RENDER: SHELL ============================= */
@@ -816,14 +921,21 @@ function renderSettings(main){
   main.appendChild(syncPanel);
 
   const panel = document.createElement('div'); panel.className='panel';
-  panel.innerHTML = `<h3>Google Gemini API key</h3><div class="save-note" style="margin-bottom:10px;">This app is a standalone page — it needs your own free Gemini key to generate flashcards and questions. Your key stays only in this browser; it's sent directly to Google, nowhere else. This does not sync between devices — enter it on each one.</div>`;
+  const syncNote = currentUser
+    ? 'This app is a standalone page — it needs your own free Gemini key to generate flashcards and questions. Since you\'re logged in, this key is now backed up to your account too — if this device ever loses its local data, logging back in will restore it automatically.'
+    : 'This app is a standalone page — it needs your own free Gemini key to generate flashcards and questions. Your key stays only in this browser right now — log in above to also back it up to your account.';
+  panel.innerHTML = `<h3>Google Gemini API key</h3><div class="save-note" style="margin-bottom:10px;">${syncNote}</div>`;
   const inp = document.createElement('input'); inp.type='password'; inp.placeholder='AIza...';
   inp.value = getApiKey();
   panel.appendChild(inp);
   const btnRow = document.createElement('div'); btnRow.className='btn-row';
   const saveBtn = document.createElement('button'); saveBtn.className='btn'; saveBtn.textContent='Save key';
-  saveBtn.onclick = ()=>{
-    localStorage.setItem('ezan:api_key', inp.value.trim());
+  saveBtn.onclick = async ()=>{
+    const key = inp.value.trim();
+    localStorage.setItem('ezan:api_key', key);
+    if(currentUser && fbDb){
+      try{ await fsSet('api_key', key); }catch(e){ console.error(e); }
+    }
     toast('API key saved.');
   };
   btnRow.appendChild(saveBtn);
@@ -1048,7 +1160,9 @@ async function renderVocabManage(main){
         text = await fileToText(file);
       }
       if(!text && !imageFile){ toast('Add some text or a file first.'); genBtn.disabled=false; loadingRow.style.display='none'; return; }
-      const items = await extractVocab(text, imageFile, LANG_NAMES[route.subject]);
+      const result = await extractVocab(text, imageFile, LANG_NAMES[route.subject]);
+      const items = result.items || [];
+      const invalidWords = result.invalid || [];
       const newCards = items.map(it=>({
         id: 'w'+Date.now()+Math.random().toString(36).slice(2,7),
         term: it.term, meaning_ar: it.meaning_ar,
@@ -1070,13 +1184,11 @@ async function renderVocabManage(main){
       });
       const merged = deck.concat(uniqueCards);
       await setDeck(route.deckKey, merged, route.ephemeral);
-      if(duplicates.length && uniqueCards.length){
-        toast(`Added ${uniqueCards.length} word(s). Skipped duplicates: ${duplicates.join(', ')}`);
-      } else if(duplicates.length){
-        toast(`This word is duplicated: ${duplicates.join(', ')}`);
-      } else {
-        toast(`Added ${uniqueCards.length} word(s).`);
-      }
+      const messages = [];
+      if(uniqueCards.length) messages.push(`Added ${uniqueCards.length} word(s).`);
+      if(duplicates.length) messages.push(`This word is duplicated: ${duplicates.join(', ')}`);
+      if(invalidWords.length) messages.push(`This word is wrong: ${invalidWords.join(', ')}`);
+      toast(messages.join(' ') || 'Nothing new to add.');
       render();
     }catch(e){
       console.error(e);
@@ -1349,7 +1461,7 @@ function pickDistractors(deck, word){
     submit.onclick = ()=>{
       const val = inp.value.trim();
       const acceptableMeanings = [word.meaning_ar, ...(word.meaning_alts||[])];
-      const correct = val.length>0 && acceptableMeanings.some(m => fuzzyArabicMatch(val, m));
+      const correct = val.length>0 && matchesAnyMeaning(val, acceptableMeanings);
       handleAnswer(word, correct, submit, row, false);
     };
     row.appendChild(submit);
@@ -1388,6 +1500,33 @@ function fuzzyArabicMatch(input, target){
   const dist = levenshtein(a, b);
   const tolerance = Math.max(2, Math.round(Math.max(a.length, b.length) * 0.25));
   return dist <= tolerance;
+}
+
+// If you type several meanings in one answer ("مختلف و مثير للجدل", "مختلف، مثير للجدل",
+// "مختلف ومثير للجدل"), split them apart and accept the answer if any part is a correct meaning.
+function splitAnswerParts(input){
+  const parts = String(input).split(/[،,؛;\/|\n]+|\s+و\s+|\s+-\s+/).map(s=>s.trim()).filter(Boolean);
+  const out = [];
+  parts.forEach(p=>{
+    out.push(p);
+    // "ومثير للجدل" = "و" (and) glued onto the next word — also try it without the leading "و"
+    if(p.startsWith('و') && p.length > 4) out.push(p.slice(1).trim());
+    // "مختلف ومثير للجدل" = "و" glued onto a later word — split at that point too
+    const tokens = p.split(/\s+/);
+    for(let k=1; k<tokens.length; k++){
+      if(tokens[k].startsWith('و') && tokens[k].length > 4){
+        out.push(tokens.slice(0,k).join(' '));
+        out.push([tokens[k].slice(1), ...tokens.slice(k+1)].join(' '));
+      }
+    }
+  });
+  return out;
+}
+function matchesAnyMeaning(input, meanings){
+  if(meanings.some(m => fuzzyArabicMatch(input, m))) return true;
+  const parts = splitAnswerParts(input);
+  if(parts.length <= 1) return false;
+  return parts.some(p => meanings.some(m => fuzzyArabicMatch(p, m)));
 }
 
 function levenshtein(a,b){
@@ -2113,10 +2252,18 @@ async function tryInitFirebase(){
   try{
     fbApp = window.__firebase.initializeApp(cfg);
     fbAuth = window.__firebase.getAuth(fbApp);
+    try{ await window.__firebase.setPersistence(fbAuth, window.__firebase.browserLocalPersistence); }catch(e){ console.error('persistence setup failed', e); }
     fbDb = window.__firebase.getFirestore(fbApp);
     await new Promise(resolve=>{
-      window.__firebase.onAuthStateChanged(fbAuth, (user)=>{
+      window.__firebase.onAuthStateChanged(fbAuth, async (user)=>{
         currentUser = user;
+        if(user) flushAllDirty();
+        if(user && !getApiKey()){
+          try{
+            const savedKey = await fsGet('api_key');
+            if(savedKey) localStorage.setItem('ezan:api_key', savedKey);
+          }catch(e){ console.error(e); }
+        }
         const cameFromLoggedOutFlow = !route || route.screen==='auth' || route.screen==='home';
         if(cameFromLoggedOutFlow){
           route = user ? {screen:'home'} : {screen:'auth'};
