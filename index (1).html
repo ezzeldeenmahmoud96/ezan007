@@ -172,6 +172,7 @@
     transition:opacity .08s;
   }
   #flash-overlay.on{opacity:0.35;}
+  #flash-overlay.good{background:var(--good);}
 
   .streak-bar{display:flex;gap:5px;margin-top:16px;justify-content:center;}
   .streak-pip{width:14px;height:14px;border-radius:50%;background:var(--line);}
@@ -679,7 +680,7 @@ IMPORTANT: the student may have typos or misspellings in their uploaded material
 For each term, provide:
 - "term": the word/phrase exactly as it should be studied
 - "meaning_ar": the single best, most common Arabic meaning (natural, accurate) — this is what's used for multiple-choice
-- "meaning_alts": an array of OTHER genuinely correct Arabic meanings for this word, if the word has more than one valid sense (e.g. a word meaning both "light" and "lamp"). If it only really has one meaning, return an empty array [].
+- "meaning_alts": an array of OTHER Arabic words/phrases that a student could reasonably answer with and still be marked correct. Be generous here — include: (a) genuinely different senses of the word (e.g. "light" meaning both "نور" and "خفيف"), AND (b) close synonyms of the main meaning that native speakers would accept as an equivalent answer (e.g. for "controversial": "مثير للجدل" as the main meaning, with "خلافي" or "مختلف عليه" as acceptable alternates). Only leave this as an empty array [] if the word truly has just one accepted way to say it in Arabic.
 - "sentences": exactly 3 different example sentences in ${lang} using the term naturally (must be different from each other)
 - "distractors": exactly 3 plausible-but-wrong Arabic meanings (near-meanings, not obviously silly)
 - "mnemonic": one short memorization aid (a trick, association, or vivid image), written entirely in ${lang} (the language being practiced, NOT Arabic), to help the word stick in memory. This is NOT a clue to the answer, it's a memory trick.
@@ -777,8 +778,15 @@ document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState=
 
 function flashWrong(){
   const ov = document.getElementById('flash-overlay');
+  ov.classList.remove('good');
   ov.classList.add('on');
   setTimeout(()=>ov.classList.remove('on'), 180);
+}
+function flashCorrect(){
+  const ov = document.getElementById('flash-overlay');
+  ov.classList.add('good');
+  ov.classList.add('on');
+  setTimeout(()=>{ ov.classList.remove('on'); ov.classList.remove('good'); }, 180);
 }
 function toast(msg){
   const t = document.createElement('div');
@@ -1555,6 +1563,7 @@ async function handleAnswer(word, correct, btnEl, containerEl, spellingClose){
 
   if(correct){
     playSuccess();
+    flashCorrect();
     if(w.stage < 2){
       w.stage += 1;
       w.wrongStreak = 0;
@@ -1675,7 +1684,7 @@ async function renderMasteredPractice(main){
     b.onclick = ()=>{
       Array.from(grid.children).forEach(c=>{ c.disabled=true; if(c.textContent===word.meaning_ar) c.classList.add('correct'); });
       let gained = 0;
-      if(opt===word.meaning_ar){ playSuccess(); gained=1; } else { b.classList.add('wrong'); flashWrong(); playFail(); }
+      if(opt===word.meaning_ar){ playSuccess(); flashCorrect(); gained=1; } else { b.classList.add('wrong'); flashWrong(); playFail(); }
       const btnRow = document.createElement('div'); btnRow.className='btn-row'; btnRow.style.justifyContent='center'; btnRow.style.marginTop='16px';
       const next = document.createElement('button'); next.className='btn'; next.textContent = idx+1<mastered.length ? 'Next word' : 'See score';
       next.onclick = ()=> go({...route, idx: idx+1, score: score+gained});
@@ -1896,7 +1905,7 @@ async function renderGrammarQuiz(main){
       const correctIdx = q.correct_index;
       grid.children[correctIdx].querySelector('.option-btn').classList.add('correct');
       let gained = 0;
-      if(i===correctIdx){ b.classList.add('correct'); playSuccess(); gained=1; }
+      if(i===correctIdx){ b.classList.add('correct'); playSuccess(); flashCorrect(); gained=1; }
       else { b.classList.add('wrong'); flashWrong(); playFail(); }
       const expl = document.createElement('div'); expl.className='hint-box'; expl.style.marginTop='14px'; expl.textContent = q.explanation || '';
       main.appendChild(expl);
@@ -2170,6 +2179,7 @@ async function handleDrillAnswer(item, correct, btnEl, containerEl, drillKey){
 
   if(correct){
     playSuccess();
+    flashCorrect();
     if(it.stage===0){
       it.stage = 1;
       it.wrongStreak = 0;
