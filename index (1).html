@@ -680,7 +680,10 @@ IMPORTANT: the student may have typos or misspellings in their uploaded material
 For each term, provide:
 - "term": the word/phrase exactly as it should be studied
 - "meaning_ar": the single best, most common Arabic meaning (natural, accurate) — this is what's used for multiple-choice
-- "meaning_alts": an array of OTHER Arabic words/phrases that a student could reasonably answer with and still be marked correct. Be generous here — include: (a) genuinely different senses of the word (e.g. "light" meaning both "نور" and "خفيف"), AND (b) close synonyms of the main meaning that native speakers would accept as an equivalent answer (e.g. for "controversial": "مثير للجدل" as the main meaning, with "خلافي" or "مختلف عليه" as acceptable alternates). Only leave this as an empty array [] if the word truly has just one accepted way to say it in Arabic.
+- "meaning_alts": an array of OTHER Arabic words/phrases that a student could reasonably answer with and still be marked correct. Be generous here, and always think about how an everyday Arabic speaker would actually answer, not just the textbook translation. Include:
+  (a) genuinely different senses of the word (e.g. "light" meaning both "نور" and "خفيف")
+  (b) close synonyms of the main meaning, including common everyday/colloquial alternatives, not just the formal dictionary word — e.g. for "house": main meaning "منزل", but "بيت" is an extremely common everyday synonym and MUST be included as an alt; for "controversial": main meaning "مثير للجدل", with "خلافي" or "مختلف عليه" as accepted alternates.
+  Only leave this as an empty array [] if the word truly has just one accepted way to say it in Arabic — for most everyday words, there is usually at least one common synonym worth including.
 - "sentences": exactly 3 different example sentences in ${lang} using the term naturally (must be different from each other)
 - "distractors": exactly 3 plausible-but-wrong Arabic meanings (near-meanings, not obviously silly)
 - "mnemonic": one short memorization aid (a trick, association, or vivid image), written entirely in ${lang} (the language being practiced, NOT Arabic), to help the word stick in memory. This is NOT a clue to the answer, it's a memory trick.
