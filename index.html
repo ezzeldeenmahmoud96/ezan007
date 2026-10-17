@@ -172,6 +172,17 @@
     transition:opacity .08s;
   }
   #flash-overlay.on{opacity:0.35;}
+  #flash-overlay.good{background:var(--good);}
+
+  @keyframes slideUpIn{from{opacity:0;transform:translateY(18px);} to{opacity:1;transform:translateY(0);}}
+  .article-badge{
+    font-family:'IBM Plex Mono',monospace;font-size:15px;color:var(--bg);background:var(--lamp);
+    padding:4px 10px;border-radius:8px;font-weight:600;animation:slideUpIn .4s ease-out;
+  }
+  .option-btn.selected{border-color:var(--lamp);background:rgba(201,162,75,0.30);color:var(--lamp);font-weight:600;}
+  .sub-question{text-align:center;margin-top:6px;}
+  .sub-question .sq-label{font-size:13px;color:var(--ink-dim);margin-bottom:12px;}
+  .sub-question .sq-term{font-family:'Fraunces',serif;font-size:34px;font-weight:600;}
 
   .streak-bar{display:flex;gap:5px;margin-top:16px;justify-content:center;}
   .streak-pip{width:14px;height:14px;border-radius:50%;background:var(--line);}
@@ -237,14 +248,14 @@
     setPersistence, browserLocalPersistence
   } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-auth.js";
   import {
-    getFirestore, doc, getDoc, setDoc
+    getFirestore, doc, getDoc, setDoc, disableNetwork, enableNetwork
   } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-firestore.js";
 
   window.__firebase = {
     initializeApp, getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
     onAuthStateChanged, signOut, sendPasswordResetEmail,
     setPersistence, browserLocalPersistence,
-    getFirestore, doc, getDoc, setDoc
+    getFirestore, doc, getDoc, setDoc, disableNetwork, enableNetwork
   };
   window.dispatchEvent(new Event('firebase-sdk-ready'));
 </script>
@@ -363,14 +374,101 @@ let memoryStore = {}; // session-only storage for "No History" decks — resets 
 
 // When logged in, everything durable goes to Firestore under this user's own document
 // (so it follows them to any device); otherwise it falls back to this browser's localStorage.
+//
+// Phones freeze network connections when the screen turns off or you switch apps. So:
+//  - every cloud call has a timeout (the app never hangs waiting on a dead connection)
+//  - every save is ALSO kept in a local copy, and re-sent to the cloud later if it didn't go through
+//  - if we couldn't read your saved data, we refuse to save over it (so a bad read can never wipe it)
+const CLOUD_TIMEOUT_MS = 8000;
+const unsafeKeys = new Set();        // keys whose cloud read failed — never overwrite these blindly
+const flushing = new Set();
+
+function withTimeout(promise, ms){
+  return new Promise((resolve, reject)=>{
+    const t = setTimeout(()=>reject(new Error('timeout')), ms);
+    promise.then(v=>{ clearTimeout(t); resolve(v); }, e=>{ clearTimeout(t); reject(e); });
+  });
+}
+function mirrorKey(key){ return 'ezan:mirror:' + currentUser.uid + ':' + key; }
+function getDirty(){ try{ return JSON.parse(localStorage.getItem('ezan:dirty') || '[]'); }catch(e){ return []; } }
+function setDirty(list){ try{ localStorage.setItem('ezan:dirty', JSON.stringify(list)); }catch(e){} }
+function markDirty(mk){ const d = getDirty(); if(!d.includes(mk)){ d.push(mk); setDirty(d); } }
+function clearDirty(mk){ setDirty(getDirty().filter(k=>k!==mk)); }
+function cloudRef(key){
+  return window.__firebase.doc(fbDb, 'users', currentUser.uid, 'data', key.replace(/\//g,'_'));
+}
+
+// Push a locally-kept copy to the cloud (used when an earlier save didn't get through).
+async function flushDirty(key){
+  const mk = mirrorKey(key);
+  if(flushing.has(mk)) return;
+  const local = localStorage.getItem(mk);
+  if(local === null) return;
+  flushing.add(mk);
+  try{
+    await withTimeout(window.__firebase.setDoc(cloudRef(key), { value: local }), CLOUD_TIMEOUT_MS);
+    clearDirty(mk);
+  }catch(e){ /* still offline — stays queued, we'll try again later */ }
+  flushing.delete(mk);
+}
+function flushAllDirty(){
+  if(!(currentUser && fbDb)) return;
+  const prefix = 'ezan:mirror:' + currentUser.uid + ':';
+  getDirty().forEach(mk=>{
+    if(mk.startsWith(prefix)) flushDirty(mk.slice(prefix.length));
+  });
+}
+
 async function fsGet(key){
-  const ref = window.__firebase.doc(fbDb, 'users', currentUser.uid, 'data', key.replace(/\//g,'_'));
-  const snap = await window.__firebase.getDoc(ref);
-  return snap.exists() ? snap.data().value : null;
+  const mk = mirrorKey(key);
+  // Unsent local changes are newer than whatever the cloud has — use them.
+  if(getDirty().includes(mk)){
+    const local = localStorage.getItem(mk);
+    if(local !== null){ flushDirty(key); return local; }
+  }
+  try{
+    const snap = await withTimeout(window.__firebase.getDoc(cloudRef(key)), CLOUD_TIMEOUT_MS);
+    const val = snap.exists() ? snap.data().value : null;
+    try{ if(val !== null) localStorage.setItem(mk, val); }catch(e){}
+    return val;
+  }catch(e){
+    const local = localStorage.getItem(mk);   // cloud unreachable — fall back to the local copy
+    if(local !== null) return local;
+    throw e;
+  }
 }
 async function fsSet(key, value){
-  const ref = window.__firebase.doc(fbDb, 'users', currentUser.uid, 'data', key.replace(/\//g,'_'));
-  await window.__firebase.setDoc(ref, { value });
+  const mk = mirrorKey(key);
+  try{ localStorage.setItem(mk, value); }catch(e){}
+  markDirty(mk);
+  try{
+    await withTimeout(window.__firebase.setDoc(cloudRef(key), { value }), CLOUD_TIMEOUT_MS);
+    clearDirty(mk);
+  }catch(e){
+    console.error('Cloud save is pending (will retry):', e);   // local copy is safe, retried later
+  }
+}
+
+async function cloudRead(fullKey){
+  try{
+    const v = await fsGet(fullKey);
+    unsafeKeys.delete(fullKey);
+    return v ? JSON.parse(v) : [];
+  }catch(e){
+    console.error(e);
+    unsafeKeys.add(fullKey);
+    return [];
+  }
+}
+async function cloudWrite(fullKey, arr){
+  if(unsafeKeys.has(fullKey)){
+    // Our last read failed. Check whether we're really back online before saving anything.
+    try{ await fsGet(fullKey); unsafeKeys.delete(fullKey); }catch(e){}
+    if(unsafeKeys.has(fullKey)){
+      throw new Error("Couldn't reach your saved data (connection problem), so this change was NOT saved — that protects your existing words from being overwritten. Check your internet and try again.");
+    }
+  }
+  await fsSet(fullKey, JSON.stringify(arr));
 }
 
 async function getDeck(key, ephemeral){
@@ -378,10 +476,7 @@ async function getDeck(key, ephemeral){
     const v = memoryStore['deck:'+key];
     return v ? JSON.parse(JSON.stringify(v)) : [];
   }
-  if(currentUser && fbDb){
-    try{ const v = await fsGet('deck:'+key); return v ? JSON.parse(v) : []; }
-    catch(e){ console.error(e); return []; }
-  }
+  if(currentUser && fbDb) return await cloudRead('deck:'+key);
   try{
     const v = localStorage.getItem('ezan:deck:'+key);
     return v ? JSON.parse(v) : [];
@@ -389,10 +484,7 @@ async function getDeck(key, ephemeral){
 }
 async function setDeck(key, arr, ephemeral){
   if(ephemeral){ memoryStore['deck:'+key] = arr; return; }
-  if(currentUser && fbDb){
-    try{ await fsSet('deck:'+key, JSON.stringify(arr)); }catch(e){ console.error(e); }
-    return;
-  }
+  if(currentUser && fbDb){ await cloudWrite('deck:'+key, arr); return; }
   try{ localStorage.setItem('ezan:deck:'+key, JSON.stringify(arr)); }catch(e){ console.error(e); }
 }
 async function getMastered(key, ephemeral){
@@ -400,10 +492,7 @@ async function getMastered(key, ephemeral){
     const v = memoryStore['mastered:'+key];
     return v ? JSON.parse(JSON.stringify(v)) : [];
   }
-  if(currentUser && fbDb){
-    try{ const v = await fsGet('mastered:'+key); return v ? JSON.parse(v) : []; }
-    catch(e){ console.error(e); return []; }
-  }
+  if(currentUser && fbDb) return await cloudRead('mastered:'+key);
   try{
     const v = localStorage.getItem('ezan:mastered:'+key);
     return v ? JSON.parse(v) : [];
@@ -411,12 +500,28 @@ async function getMastered(key, ephemeral){
 }
 async function setMastered(key, arr, ephemeral){
   if(ephemeral){ memoryStore['mastered:'+key] = arr; return; }
-  if(currentUser && fbDb){
-    try{ await fsSet('mastered:'+key, JSON.stringify(arr)); }catch(e){ console.error(e); }
-    return;
-  }
+  if(currentUser && fbDb){ await cloudWrite('mastered:'+key, arr); return; }
   try{ localStorage.setItem('ezan:mastered:'+key, JSON.stringify(arr)); }catch(e){ console.error(e); }
 }
+
+// If a save is refused because we're offline, tell the user instead of failing silently.
+window.addEventListener('unhandledrejection', (e)=>{
+  const msg = e.reason && e.reason.message;
+  if(msg && msg.includes("Couldn't reach your saved data")) toast(msg);
+});
+
+// When you come back to the app (screen on / switched back), wake the connection up
+// and send anything that was waiting.
+document.addEventListener('visibilitychange', async ()=>{
+  if(document.visibilityState !== 'visible') return;
+  try{
+    if(fbDb && window.__firebase.disableNetwork && window.__firebase.enableNetwork){
+      await window.__firebase.disableNetwork(fbDb);
+      await window.__firebase.enableNetwork(fbDb);
+    }
+  }catch(e){}
+  flushAllDirty();
+});
 
 
 /* ============================= AI CALL ============================= */
@@ -576,23 +681,26 @@ async function extractVocab(text, imageFile, language){
   const lang = language || 'English';
   const germanRule = lang === 'German' ? `
 GERMAN-SPECIFIC RULES (important, follow exactly):
-- If the term is a noun, the "term" field MUST include the correct definite article as part of the word itself — e.g. "der Tisch", "die Frau", "das Buch". Never give a bare noun without its article.
+- If the term is a noun, the "term" field must be the BARE noun with NO article attached (e.g. "Tisch", not "der Tisch"). Separately, provide an "article" field with just the correct definite article: "der", "die", or "das". Leave "article" as an empty string "" for anything that isn't a noun.
 - If the term is a verb, ALWAYS normalize the "term" field to its base infinitive form, even if the source material shows it conjugated or in a different tense/form (e.g. if the material shows "gemacht", "macht", or "machte", the "term" should still be "machen" — never save the conjugated form itself as the term). Also provide a "pastForm" field with its past participle (Partizip II) — e.g. for "machen" give "gemacht", for "gehen" give "gegangen". Leave "pastForm" as an empty string "" for nouns and everything else.` : `
-- Include a "pastForm" field in every item, always as an empty string "" (not used for this language).`;
+- Include "article" and "pastForm" fields in every item, always as empty strings "" (not used for this language).`;
   const prompt = `You are building language-study flashcards from material a student uploaded. The student is practicing ${lang}.
 Go through the ENTIRE content and extract EVERY distinct ${lang} word or term worth studying — do not skip any, do not cap the count, cover it all completely (skip only trivial/common function words like "the", "a", "und", "le" that aren't worth studying on their own).
 IMPORTANT: the student may have typos or misspellings in their uploaded material. If a word is an obvious typo/misspelling of a real ${lang} word, silently correct it to the real, properly-spelled word for the "term" field — never build a flashcard around a misspelled or non-existent word. Only skip a word entirely if it's genuinely unrecognizable gibberish.
 For each term, provide:
 - "term": the word/phrase exactly as it should be studied
 - "meaning_ar": the single best, most common Arabic meaning (natural, accurate) — this is what's used for multiple-choice
-- "meaning_alts": an array of OTHER genuinely correct Arabic meanings for this word, if the word has more than one valid sense (e.g. a word meaning both "light" and "lamp"). If it only really has one meaning, return an empty array [].
+- "meaning_alts": an array of OTHER Arabic words/phrases that a student could reasonably answer with and still be marked correct. Be generous here, and always think about how an everyday Arabic speaker would actually answer, not just the textbook translation. Include:
+  (a) genuinely different senses of the word (e.g. "light" meaning both "نور" and "خفيف")
+  (b) close synonyms of the main meaning, including common everyday/colloquial alternatives, not just the formal dictionary word — e.g. for "house": main meaning "منزل", but "بيت" is an extremely common everyday synonym and MUST be included as an alt; for "controversial": main meaning "مثير للجدل", with "خلافي" or "مختلف عليه" as accepted alternates.
+  Only leave this as an empty array [] if the word truly has just one accepted way to say it in Arabic — for most everyday words, there is usually at least one common synonym worth including.
 - "sentences": exactly 3 different example sentences in ${lang} using the term naturally (must be different from each other)
 - "distractors": exactly 3 plausible-but-wrong Arabic meanings (near-meanings, not obviously silly)
 - "mnemonic": one short memorization aid (a trick, association, or vivid image), written entirely in ${lang} (the language being practiced, NOT Arabic), to help the word stick in memory. This is NOT a clue to the answer, it's a memory trick.
 - "pastForm": see rule below
 ${germanRule}
 Respond with ONLY a raw JSON object, no markdown fences, no commentary. Schema:
-{"items":[{"term":"","meaning_ar":"","meaning_alts":[],"sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":""}],"invalid":["any word from the material that was genuinely unrecognizable gibberish, listed exactly as it appeared"]}`;
+{"items":[{"term":"","meaning_ar":"","meaning_alts":[],"sentences":["","",""],"distractors":["","",""],"mnemonic":"","pastForm":"","article":""}],"invalid":["any word from the material that was genuinely unrecognizable gibberish, listed exactly as it appeared"]}`;
 
   let content;
   if(imageFile){
@@ -658,25 +766,40 @@ function playFail(){
 // Fix: "unlock" both audio elements on the very first tap anywhere in the app —
 // once a media element has successfully played once within a real user gesture,
 // browsers allow it to be played programmatically afterward, even from async code.
-document.addEventListener('click', function unlockAudioOnce(){
-  ['success-sound','fail-sound'].forEach(id=>{
-    const el = document.getElementById(id);
-    if(!el) return;
-    const prevMuted = el.muted;
-    el.muted = true;
-    el.play().then(()=>{
-      el.pause();
-      el.currentTime = 0;
-      el.muted = prevMuted;
-    }).catch(()=>{ el.muted = prevMuted; });
-  });
-  document.removeEventListener('click', unlockAudioOnce);
-}, {once:true});
+let audioUnlockArmed = false;
+function armAudioUnlock(){
+  if(audioUnlockArmed) return;
+  audioUnlockArmed = true;
+  document.addEventListener('click', function unlockAudioOnce(){
+    audioUnlockArmed = false;
+    ['success-sound','fail-sound'].forEach(id=>{
+      const el = document.getElementById(id);
+      if(!el) return;
+      const prevMuted = el.muted;
+      el.muted = true;
+      el.play().then(()=>{
+        el.pause();
+        el.currentTime = 0;
+        el.muted = prevMuted;
+      }).catch(()=>{ el.muted = prevMuted; });
+    });
+  }, {once:true});
+}
+armAudioUnlock();
+// After the phone sleeps or you switch apps, browsers can forget the sound permission — ask again on next tap.
+document.addEventListener('visibilitychange', ()=>{ if(document.visibilityState==='visible') armAudioUnlock(); });
 
 function flashWrong(){
   const ov = document.getElementById('flash-overlay');
+  ov.classList.remove('good');
   ov.classList.add('on');
   setTimeout(()=>ov.classList.remove('on'), 180);
+}
+function flashCorrect(){
+  const ov = document.getElementById('flash-overlay');
+  ov.classList.add('good');
+  ov.classList.add('on');
+  setTimeout(()=>{ ov.classList.remove('on'); ov.classList.remove('good'); }, 180);
 }
 function toast(msg){
   const t = document.createElement('div');
@@ -1065,6 +1188,7 @@ async function renderVocabManage(main){
         id: 'w'+Date.now()+Math.random().toString(36).slice(2,7),
         term: it.term, meaning_ar: it.meaning_ar,
         sentences: it.sentences, distractors: it.distractors, mnemonic: it.mnemonic, pastForm: it.pastForm || '',
+        article: (['der','die','das'].includes(String(it.article||'').trim().toLowerCase()) ? String(it.article).trim().toLowerCase() : ''), articleRevealed: false,
         meaning_alts: Array.isArray(it.meaning_alts) ? it.meaning_alts : [],
         stage: 0, wrongStreak: 0, streak: 0, hintUsed:false
       }));
@@ -1121,7 +1245,7 @@ async function renderVocabManage(main){
       const tr = document.createElement('tr');
       const stageLabel = w.streak>=6 ? 'mastered' : `stage ${w.stage}${w.streak>0?(' · streak '+w.streak):''}`;
       let saveCell = '';
-      const tdTerm = document.createElement('td'); tdTerm.textContent = w.term + (w.pastForm ? ' · ' + w.pastForm : '');
+      const tdTerm = document.createElement('td'); tdTerm.textContent = (w.article ? w.article + ' ' : '') + w.term + (w.pastForm ? ' · ' + w.pastForm : '');
       const tdAr = document.createElement('td'); tdAr.className='ar'; tdAr.textContent = w.meaning_ar;
       const tdStage = document.createElement('td'); tdStage.className='mono'; tdStage.style.fontSize='11px'; tdStage.style.color='var(--ink-dim)'; tdStage.textContent = stageLabel;
       const tdDel = document.createElement('td'); tdDel.className='del'; tdDel.textContent='✕';
@@ -1162,6 +1286,13 @@ let studyState = null;
 async function renderVocabStudy(main){
   backRow(main, 'Back to deck', async ()=>{ studyState=null; go({...route, screen:'vocab_manage'}); });
 
+  // A word that reached its 6th point but never got moved (e.g. the app was closed mid-bonus-question)
+  {
+    const d0 = await getDeck(route.deckKey, route.ephemeral);
+    const pendingId = (studyState && studyState.sub) ? studyState.current : null;
+    for(const w of d0){ if(w.streak >= 6 && w.id !== pendingId) await graduateWord(w.id); }
+  }
+
   if(!studyState || studyState.deckKey !== route.deckKey){
     const deck = await getDeck(route.deckKey, route.ephemeral);
     const active = deck.filter(w=>w.streak < 6);
@@ -1178,6 +1309,7 @@ async function renderVocabStudy(main){
   const word = deck.find(w=>w.id===studyState.current);
   if(!word){ studyState=null; return renderVocabStudy(main); }
 
+  if(studyState.sub){ renderSubQuestion(main, deck, word); return; }
   renderStageTrack(main, word);
   renderCardBody(main, deck, word);
 }
@@ -1201,6 +1333,7 @@ function pickNextCard(deck){
   studyState.current = choice.id;
   studyState.revealed = false;
   studyState.hintShown = false;
+  studyState.sub = null;
   studyState.sentenceIdx = Math.floor(Math.random()*3);
   recent.push(choice.id);
   if(recent.length > RECENT_GAP) recent.shift();
@@ -1241,6 +1374,7 @@ function renderCardBody(main, deck, word){
 
   const termRow = document.createElement('div');
   termRow.style.display='flex'; termRow.style.alignItems='center'; termRow.style.justifyContent='center'; termRow.style.gap='10px'; termRow.style.flexWrap='wrap';
+  if(word.article && word.articleRevealed) termRow.appendChild(articleBadge(word.article));
   const termEl = document.createElement('div'); termEl.className='term'; termEl.textContent = word.term;
   termRow.appendChild(termEl);
   termRow.appendChild(speakBtn(word.term, langCode));
@@ -1355,12 +1489,42 @@ function pickDistractors(deck, word){
     const row = document.createElement('div'); row.className='recall-row';
     const inp = document.createElement('input'); inp.type='text'; inp.placeholder='اكتب المعنى بالعربي';
     row.appendChild(inp);
+    // Nouns whose article is still hidden: ask for the article here too, under the typing box.
+    const artActive = !!(word.article && !word.articleRevealed);
+    let selectedArticle = null;
+    const artBtns = [];
+    if(artActive){
+      const artLabel = document.createElement('div');
+      artLabel.className = 'save-note'; artLabel.style.marginTop = '4px'; artLabel.textContent = 'Which article goes with this word?';
+      row.appendChild(artLabel);
+      const artRow = document.createElement('div');
+      artRow.style.display = 'flex'; artRow.style.gap = '8px'; artRow.style.width = '100%';
+      shuffle(['der','die','das','den']).forEach(a=>{
+        const ab = document.createElement('button'); ab.className = 'option-btn'; ab.textContent = a;
+        ab.style.direction = 'ltr'; ab.style.textAlign = 'center'; ab.style.flex = '1'; ab.style.padding = '12px 4px';
+        ab.onclick = ()=>{ selectedArticle = a; artBtns.forEach(x=>x.classList.toggle('selected', x === ab)); };
+        artBtns.push(ab); artRow.appendChild(ab);
+      });
+      row.appendChild(artRow);
+    }
     const submit = document.createElement('button'); submit.className='btn'; submit.textContent='Check';
     submit.onclick = ()=>{
+      if(artActive && !selectedArticle){ toast('Pick an article too.'); return; }
       const val = inp.value.trim();
       const acceptableMeanings = [word.meaning_ar, ...(word.meaning_alts||[])];
-      const correct = val.length>0 && acceptableMeanings.some(m => fuzzyArabicMatch(val, m));
-      handleAnswer(word, correct, submit, row, false);
+      const correct = val.length>0 && matchesAnyMeaning(val, acceptableMeanings);
+      // The article only counts when the meaning was right (a wrong meaning already has its own penalty).
+      let articleResult = null;
+      if(artActive && correct){
+        articleResult = (selectedArticle === word.article);
+        artBtns.forEach(x=>{
+          x.disabled = true;
+          if(x.textContent === word.article) x.classList.add('correct');
+          else if(x.classList.contains('selected')) x.classList.add('wrong');
+        });
+        if(!articleResult) termRow.insertBefore(articleBadge(word.article), termRow.firstChild);   // slides in next to the word
+      }
+      handleAnswer(word, correct, submit, row, false, articleResult);
     };
     row.appendChild(submit);
     main.appendChild(row);
@@ -1400,6 +1564,33 @@ function fuzzyArabicMatch(input, target){
   return dist <= tolerance;
 }
 
+// If you type several meanings in one answer ("مختلف و مثير للجدل", "مختلف، مثير للجدل",
+// "مختلف ومثير للجدل"), split them apart and accept the answer if any part is a correct meaning.
+function splitAnswerParts(input){
+  const parts = String(input).split(/[،,؛;\/|\n]+|\s+و\s+|\s+-\s+/).map(s=>s.trim()).filter(Boolean);
+  const out = [];
+  parts.forEach(p=>{
+    out.push(p);
+    // "ومثير للجدل" = "و" (and) glued onto the next word — also try it without the leading "و"
+    if(p.startsWith('و') && p.length > 4) out.push(p.slice(1).trim());
+    // "مختلف ومثير للجدل" = "و" glued onto a later word — split at that point too
+    const tokens = p.split(/\s+/);
+    for(let k=1; k<tokens.length; k++){
+      if(tokens[k].startsWith('و') && tokens[k].length > 4){
+        out.push(tokens.slice(0,k).join(' '));
+        out.push([tokens[k].slice(1), ...tokens.slice(k+1)].join(' '));
+      }
+    }
+  });
+  return out;
+}
+function matchesAnyMeaning(input, meanings){
+  if(meanings.some(m => fuzzyArabicMatch(input, m))) return true;
+  const parts = splitAnswerParts(input);
+  if(parts.length <= 1) return false;
+  return parts.some(p => meanings.some(m => fuzzyArabicMatch(p, m)));
+}
+
 function levenshtein(a,b){
   const m=a.length,n=b.length;
   const dp = Array.from({length:m+1},()=>new Array(n+1).fill(0));
@@ -1411,7 +1602,7 @@ function levenshtein(a,b){
   return dp[m][n];
 }
 
-async function handleAnswer(word, correct, btnEl, containerEl, spellingClose){
+async function handleAnswer(word, correct, btnEl, containerEl, spellingClose, articleResult){
   const deck = await getDeck(route.deckKey, route.ephemeral);
   const idx = deck.findIndex(w=>w.id===word.id);
   if(idx===-1) return;
@@ -1426,25 +1617,28 @@ async function handleAnswer(word, correct, btnEl, containerEl, spellingClose){
 
   if(correct){
     playSuccess();
+    flashCorrect();
     if(w.stage < 2){
       w.stage += 1;
       w.wrongStreak = 0;
     } else {
       w.streak = Math.min(6, w.streak + 1);
       w.wrongStreak = 0;
-      if(w.streak >= 6){
-        const rest = deck.filter(x=>x.id!==w.id);
-        await setDeck(route.deckKey, rest, route.ephemeral);
-        const mastered = await getMastered(route.deckKey, route.ephemeral);
-        mastered.push({term:w.term, meaning_ar:w.meaning_ar, pastForm:w.pastForm||''});
-        await setMastered(route.deckKey, mastered, route.ephemeral);
-        toast(`"${w.term}" mastered! Moved to your mastered list.`);
-        setTimeout(async ()=>{ const d2 = await getDeck(route.deckKey, route.ephemeral); if(d2.length){ pickNextCard(d2); render(); } else { go({...route, screen:'vocab_manage'}); } }, 700);
-        return;
-      }
     }
+    if(articleResult === false) applySubResult(w, 'article', false);   // wrong article: reveal it + lose one step/point
     await setDeck(route.deckKey, deck, route.ephemeral);
-    setTimeout(async ()=>{ const d2 = await getDeck(route.deckKey, route.ephemeral); pickNextCard(d2); render(); }, 500);
+    // Verbs in their last 3 streak points get a past-form bonus question.
+    const subType = subQuestionFor(w);
+    if(subType){
+      studyState.sub = {
+        type: subType, answered: false,
+        correctAnswer: subType === 'article' ? w.article : w.pastForm,
+        choices: subType === 'article' ? shuffle(['der','die','das','den']) : pastFormChoices(deck, w)
+      };
+      setTimeout(()=>render(), 450);
+      return;
+    }
+    advanceFrom(w.id, articleResult === false ? 2600 : 500);
   } else {
     flashWrong();
     playFail();
@@ -1465,6 +1659,134 @@ async function handleAnswer(word, correct, btnEl, containerEl, spellingClose){
     await setDeck(route.deckKey, deck, route.ephemeral);
     setTimeout(()=>{ render(); }, 500);
   }
+}
+
+
+/* ============================= BONUS QUESTIONS (article / past form) ============================= */
+
+// Call AFTER the normal correct-answer update has been applied to `word`.
+function subQuestionFor(word){
+  if(word.pastForm && word.stage >= 2 && word.streak >= 4) return 'pastform';    // the last 3 streak points (4th, 5th, 6th)
+  return null;
+}
+
+// A correct bonus answer changes nothing (the normal +1 already counted).
+// A wrong one costs one step back and, for articles, reveals the article from then on.
+function applySubResult(word, type, correct){
+  if(correct) return;
+  if(type === 'article'){
+    word.articleRevealed = true;
+    if(word.streak === 0) word.stage = Math.max(0, word.stage - 1);   // still in the 3 learning stages: back one stage
+    else word.streak = Math.max(0, word.streak - 1);                   // already in the streak: lose one point
+  } else if(type === 'pastform'){
+    word.streak = Math.max(0, word.streak - 1);
+  }
+}
+
+function pastFormChoices(deck, word){
+  const correct = word.pastForm;
+  const seen = new Set([correct.toLowerCase()]);
+  const picks = [];
+  shuffle(deck.filter(w => w.id !== word.id && w.pastForm)).forEach(w=>{
+    const k = w.pastForm.toLowerCase();
+    if(picks.length < 3 && !seen.has(k)){ seen.add(k); picks.push(w.pastForm); }
+  });
+  // not enough other verbs yet? add believable mistakes (infinitive, wrong participle, simple past)
+  const stem = word.term.replace(/en$/, '');
+  [word.term, 'ge' + word.term, stem + 'te', 'ge' + stem + 'en'].forEach(t=>{
+    const k = t.toLowerCase();
+    if(picks.length < 3 && !seen.has(k)){ seen.add(k); picks.push(t); }
+  });
+  return shuffle([correct, ...picks]);
+}
+
+async function graduateWord(wordId){
+  const deck = await getDeck(route.deckKey, route.ephemeral);
+  const w = deck.find(x=>x.id === wordId);
+  if(!w || w.streak < 6) return false;
+  await setDeck(route.deckKey, deck.filter(x=>x.id !== wordId), route.ephemeral);
+  const mastered = await getMastered(route.deckKey, route.ephemeral);
+  mastered.push({term:w.term, meaning_ar:w.meaning_ar, pastForm:w.pastForm||'', article:w.article||'', articleRevealed:w.articleRevealed||false});
+  await setMastered(route.deckKey, mastered, route.ephemeral);
+  toast(`"${w.term}" mastered! Moved to your mastered list.`);
+  return true;
+}
+
+async function advanceFrom(wordId, delay){
+  const graduated = await graduateWord(wordId);
+  setTimeout(async ()=>{
+    const d2 = await getDeck(route.deckKey, route.ephemeral);
+    if(d2.filter(w=>w.streak < 6).length){
+      pickNextCard(d2);
+      render();
+    } else {
+      go({...route, screen:'vocab_manage'});
+    }
+  }, graduated ? 700 : delay);
+}
+
+function renderSubQuestion(main, deck, word){
+  const sub = studyState.sub;
+  const langCode = LANG_CODES[route.subject] || 'en-US';
+  const wrap = document.createElement('div'); wrap.className = 'sub-question';
+  const lbl = document.createElement('div'); lbl.className = 'sq-label';
+  lbl.textContent = sub.type === 'article' ? 'Bonus question — which article goes with this word?' : 'Bonus question — what is its past form?';
+  wrap.appendChild(lbl);
+
+  const termRow = document.createElement('div');
+  termRow.style.display='flex'; termRow.style.alignItems='center'; termRow.style.justifyContent='center'; termRow.style.gap='10px'; termRow.style.flexWrap='wrap';
+  const termEl = document.createElement('div'); termEl.className = 'sq-term'; termEl.textContent = word.term;
+  termRow.appendChild(termEl);
+  termRow.appendChild(speakBtn(word.term, langCode));
+  wrap.appendChild(termRow);
+  main.appendChild(wrap);
+
+  const grid = document.createElement('div'); grid.className = 'options-grid'; grid.style.marginTop = '24px';
+  const btns = [];
+
+  const showNext = ()=>{
+    const row = document.createElement('div'); row.className = 'btn-row'; row.style.justifyContent = 'center'; row.style.marginTop = '16px';
+    const next = document.createElement('button'); next.className = 'btn'; next.textContent = 'Next word';
+    next.onclick = ()=> advanceFrom(word.id, 0);
+    row.appendChild(next);
+    main.appendChild(row);
+  };
+
+  sub.choices.forEach(choice=>{
+    const b = document.createElement('button'); b.className = 'option-btn'; b.textContent = choice;
+    b.style.direction = 'ltr'; b.style.textAlign = 'center';
+    b.onclick = async ()=>{
+      if(sub.answered) return;
+      sub.answered = true;
+      const correct = choice === sub.correctAnswer;
+      btns.forEach(x=>{ x.disabled = true; if(x.textContent === sub.correctAnswer) x.classList.add('correct'); });
+      if(correct){ playSuccess(); flashCorrect(); }
+      else { b.classList.add('wrong'); playFail(); flashWrong(); }
+
+      const d = await getDeck(route.deckKey, route.ephemeral);
+      const w = d.find(x=>x.id === word.id);
+      if(w){
+        applySubResult(w, sub.type, correct);
+        await setDeck(route.deckKey, d, route.ephemeral);
+      }
+      if(correct){
+        advanceFrom(word.id, 700);
+      } else {
+        if(sub.type === 'article') termRow.insertBefore(articleBadge(sub.correctAnswer), termRow.firstChild);   // slides in next to the word
+        showNext();
+      }
+    };
+    btns.push(b);
+    grid.appendChild(b);
+  });
+  main.appendChild(grid);
+}
+
+function articleBadge(article){
+  const b = document.createElement('div');
+  b.className = 'article-badge';
+  b.textContent = article;
+  return b;
 }
 
 /* ============================= MASTERED LIST ============================= */
@@ -1528,6 +1850,7 @@ async function renderMasteredPractice(main){
   const cw = document.createElement('div'); cw.className='card-word';
   const termRow = document.createElement('div');
   termRow.style.display='flex'; termRow.style.alignItems='center'; termRow.style.justifyContent='center'; termRow.style.gap='10px';
+  if(word.article && word.articleRevealed) termRow.appendChild(articleBadge(word.article));
   const termEl = document.createElement('div'); termEl.className='term'; termEl.textContent = word.term;
   termRow.appendChild(termEl);
   termRow.appendChild(speakBtn(word.term, LANG_CODES[route.subject] || 'en-US'));
@@ -1546,7 +1869,7 @@ async function renderMasteredPractice(main){
     b.onclick = ()=>{
       Array.from(grid.children).forEach(c=>{ c.disabled=true; if(c.textContent===word.meaning_ar) c.classList.add('correct'); });
       let gained = 0;
-      if(opt===word.meaning_ar){ playSuccess(); gained=1; } else { b.classList.add('wrong'); flashWrong(); playFail(); }
+      if(opt===word.meaning_ar){ playSuccess(); flashCorrect(); gained=1; } else { b.classList.add('wrong'); flashWrong(); playFail(); }
       const btnRow = document.createElement('div'); btnRow.className='btn-row'; btnRow.style.justifyContent='center'; btnRow.style.marginTop='16px';
       const next = document.createElement('button'); next.className='btn'; next.textContent = idx+1<mastered.length ? 'Next word' : 'See score';
       next.onclick = ()=> go({...route, idx: idx+1, score: score+gained});
@@ -1767,7 +2090,7 @@ async function renderGrammarQuiz(main){
       const correctIdx = q.correct_index;
       grid.children[correctIdx].querySelector('.option-btn').classList.add('correct');
       let gained = 0;
-      if(i===correctIdx){ b.classList.add('correct'); playSuccess(); gained=1; }
+      if(i===correctIdx){ b.classList.add('correct'); playSuccess(); flashCorrect(); gained=1; }
       else { b.classList.add('wrong'); flashWrong(); playFail(); }
       const expl = document.createElement('div'); expl.className='hint-box'; expl.style.marginTop='14px'; expl.textContent = q.explanation || '';
       main.appendChild(expl);
@@ -2041,6 +2364,7 @@ async function handleDrillAnswer(item, correct, btnEl, containerEl, drillKey){
 
   if(correct){
     playSuccess();
+    flashCorrect();
     if(it.stage===0){
       it.stage = 1;
       it.wrongStreak = 0;
@@ -2128,6 +2452,7 @@ async function tryInitFirebase(){
     await new Promise(resolve=>{
       window.__firebase.onAuthStateChanged(fbAuth, async (user)=>{
         currentUser = user;
+        if(user) flushAllDirty();
         if(user && !getApiKey()){
           try{
             const savedKey = await fsGet('api_key');
